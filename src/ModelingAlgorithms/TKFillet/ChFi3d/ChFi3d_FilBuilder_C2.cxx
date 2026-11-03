@@ -35,6 +35,7 @@
 #include <ChFiDS_Stripe.hxx>
 #include <ChFiKPart_ComputeData.hxx>
 #include <Geom_BSplineSurface.hxx>
+#include <Geom_Plane.hxx>
 #include <Geom2d_TrimmedCurve.hxx>
 #include <Geom2dAdaptor_Curve.hxx>
 #include <Geom2dConvert.hxx>
@@ -43,7 +44,9 @@
 #include <GeomFill_ConstrainedFilling.hxx>
 #include <GeomFill_SimpleBound.hxx>
 #include <gp_Ax3.hxx>
+#include <gp_Cylinder.hxx>
 #include <gp_Dir.hxx>
+#include <gp_Lin.hxx>
 #include <gp_Pln.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Pnt2d.hxx>
@@ -118,6 +121,55 @@ static bool ToricRotule(const BRepAdaptor_Surface&        fac,
   double r1 = sp1->Radius();
   double r2 = sp2->Radius();
   return std::abs(r1 - r2) < tolesp;
+}
+
+// Equal-radius rims on cylindrical supports perpendicular to a plane have
+// the same horn-torus corner as their tangent planes at coincident contacts.
+static bool CylindricalRotule(const BRepAdaptor_Surface&          theFace,
+                              const BRepAdaptor_Surface&          theSurface1,
+                              const BRepAdaptor_Surface&          theSurface2,
+                              const occ::handle<ChFiDS_Stripe>& theStripe1,
+                              const occ::handle<ChFiDS_Stripe>& theStripe2,
+                              const gp_Pnt&                       theContact,
+                              const double                        theTolerance,
+                              occ::handle<Adaptor3d_Surface>&     thePlane1,
+                              occ::handle<Adaptor3d_Surface>&     thePlane2)
+{
+  if (theFace.GetType() != GeomAbs_Plane
+      || theSurface1.GetType() != GeomAbs_Cylinder
+      || theSurface2.GetType() != GeomAbs_Cylinder)
+  {
+    return false;
+  }
+  const auto aSpine1 = occ::down_cast<ChFiDS_FilSpine>(theStripe1->Spine());
+  const auto aSpine2 = occ::down_cast<ChFiDS_FilSpine>(theStripe2->Spine());
+  if (aSpine1.IsNull() || aSpine2.IsNull() || !aSpine1->IsConstant()
+      || !aSpine2->IsConstant() || aSpine1->Radius() <= 0.
+      || aSpine1->Radius() != aSpine2->Radius())
+  {
+    return false;
+  }
+  const gp_Dir aNormal = theFace.Plane().Axis().Direction();
+  const gp_Cylinder aCylinder1 = theSurface1.Cylinder();
+  const gp_Cylinder aCylinder2 = theSurface2.Cylinder();
+  if (!aCylinder1.Axis().IsParallel(gp_Ax1(theContact, aNormal), Precision::Angular())
+      || !aCylinder2.Axis().IsParallel(gp_Ax1(theContact, aNormal), Precision::Angular()))
+  {
+    return false;
+  }
+  const gp_Lin anAxis1(aCylinder1.Axis()), anAxis2(aCylinder2.Axis());
+  if (std::abs(anAxis1.Distance(theContact) - aCylinder1.Radius()) > theTolerance
+      || std::abs(anAxis2.Distance(theContact) - aCylinder2.Radius()) > theTolerance)
+  {
+    return false;
+  }
+  gp_Vec aRadial1(aCylinder1.Location(), theContact);
+  gp_Vec aRadial2(aCylinder2.Location(), theContact);
+  aRadial1 -= gp_Vec(aNormal) * aRadial1.Dot(gp_Vec(aNormal));
+  aRadial2 -= gp_Vec(aNormal) * aRadial2.Dot(gp_Vec(aNormal));
+  thePlane1 = new GeomAdaptor_Surface(new Geom_Plane(theContact, gp_Dir(aRadial1)));
+  thePlane2 = new GeomAdaptor_Surface(new Geom_Plane(theContact, gp_Dir(aRadial2)));
+  return true;
 }
 
 static void RemoveSD(occ::handle<ChFiDS_Stripe>& Stripe, const int num1, const int num2)
@@ -460,6 +512,21 @@ void ChFi3d_FilBuilder::PerformTwoCorner(const int Index)
   ChFiDS_CommonPoint      cp11, cp12, cp21, cp22;
   ChFiDS_FaceInterference intf11, intf12, intf21, intf22;
 
+  occ::handle<Adaptor3d_Surface> aCornerSupport1 = HBRS1;
+  occ::handle<Adaptor3d_Surface> aCornerSupport2 = HBRS2;
+  const bool isCylindricalRotule =
+    SameSide && c1rotule && sameparam
+    && CP1.Point().SquareDistance(CP2.Point()) <= Precision::SquareConfusion()
+    && CylindricalRotule(BRFaCo,
+                         BRS1,
+                         BRS2,
+                         st1,
+                         st2,
+                         CP1.Point(),
+                         tolapp3d,
+                         aCornerSupport1,
+                         aCornerSupport2);
+
   if (c1biseau)
   {
 #ifdef OCCT_DEBUG
@@ -479,7 +546,7 @@ void ChFi3d_FilBuilder::PerformTwoCorner(const int Index)
       return;
     }
   }
-  else if (c1rotule)
+  else if (c1rotule && !isCylindricalRotule)
   { // save.
     cp11   = sd1->Vertex(isfirst1, 1);
     cp12   = sd1->Vertex(isfirst1, 2);
@@ -526,7 +593,7 @@ void ChFi3d_FilBuilder::PerformTwoCorner(const int Index)
 
     if (SameSide)
     {
-      if (ToricRotule(BRFaCo, BRS1, BRS2, st1, st2))
+      if (isCylindricalRotule || ToricRotule(BRFaCo, BRS1, BRS2, st1, st2))
       {
         // Direct construction.
         // ---------------------
@@ -545,6 +612,19 @@ void ChFi3d_FilBuilder::PerformTwoCorner(const int Index)
         }
         op1 = TopAbs::Reverse(op1);
         op2 = TopAbs::Reverse(op2);
+        if (isCylindricalRotule)
+        {
+          const auto uv1 = sd1->Interference(IFaCo1).PCurveOnFace()->Value(
+            sd1->Interference(IFaArc1).Parameter(isfirst1));
+          const auto uv2 = sd2->Interference(IFaCo2).PCurveOnFace()->Value(
+            sd2->Interference(IFaArc2).Parameter(isfirst2));
+          const gp_Vec aOffset1(CP1.Point(), BRFaCo.Value(uv1.X(), uv1.Y()));
+          const gp_Vec aOffset2(CP2.Point(), BRFaCo.Value(uv2.X(), uv2.Y()));
+          op1 = aOffset1.Dot(gp_Vec(aCornerSupport1->Plane().Axis().Direction())) > 0.
+                  ? TopAbs_FORWARD : TopAbs_REVERSED;
+          op2 = aOffset2.Dot(gp_Vec(aCornerSupport2->Plane().Axis().Direction())) > 0.
+                  ? TopAbs_FORWARD : TopAbs_REVERSED;
+        }
 #ifdef OCCT_DEBUG
         ChFi3d_InitChron(ch); // init perf ChFiKPart_ComputeData
 #endif
@@ -552,8 +632,8 @@ void ChFi3d_FilBuilder::PerformTwoCorner(const int Index)
         done          = ChFiKPart_ComputeData::ComputeCorner(DStr,
                                                     coin,
                                                     HFaCo,
-                                                    HBRS1,
-                                                    HBRS2,
+                                                    aCornerSupport1,
+                                                    aCornerSupport2,
                                                     OFaCo,
                                                     ori,
                                                     op1,
