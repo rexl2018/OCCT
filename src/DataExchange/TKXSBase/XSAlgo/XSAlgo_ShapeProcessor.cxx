@@ -13,11 +13,19 @@
 
 #include "XSAlgo_ShapeProcessor.hxx"
 
+#include <Approx_SameParameter.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
+#include <BRepLib_CheckCurveOnSurface.hxx>
 #include <BRepTools_ReShape.hxx>
 #include <BRep_Builder.hxx>
 #include <BRep_Tool.hxx>
+#include <Geom2dAdaptor_Curve.hxx>
+#include <Geom2d_BSplineCurve.hxx>
+#include <GeomAdaptor_Curve.hxx>
+#include <GeomAdaptor_Surface.hxx>
+#include <Geom_BSplineCurve.hxx>
 #include <Geom_Curve.hxx>
+#include <Geom_CylindricalSurface.hxx>
 #include <Interface_Static.hxx>
 #include <Message_Msg.hxx>
 #include <NCollection_List.hxx>
@@ -448,18 +456,58 @@ bool XSAlgo_ShapeProcessor::CheckPCurve(const TopoDS_Edge& theEdge,
   // if result is not nice, try to call projection and take the best
   if (aTolerance > std::min(1., 2. * thePrecision) || !aSameRangeFlag)
   {
-    // pdn trying to recompute pcurve
-    TopoDS_Edge anEdgePr = MakeEdgeOnCurve(theEdge);
-    anEdgeFixer->FixAddPCurve(anEdgePr, theFace, theIsSeam, thePrecision);
-    anEdgeFixer->FixSameParameter(anEdgePr);
-    const double aTolerancePr = BRep_Tool::Tolerance(anEdgePr);
-    // pdn choose the best pcurve
-    if (aTolerancePr < aTolerance || !aSameRangeFlag)
+    // A sampled tolerance can miss a local parameterization error. Before
+    // replacing an imported spline on a cylinder by projection, try
+    // reparameterizing it within the existing edge tolerance. Never derive a tolerance from the
+    // measured deviation.
+    if (!theIsSeam && aSameRangeFlag
+        && aSurface->IsKind(STANDARD_TYPE(Geom_CylindricalSurface))
+        && aCurve3D->IsKind(STANDARD_TYPE(Geom_BSplineCurve))
+        && aCurve2D->IsKind(STANDARD_TYPE(Geom2d_BSplineCurve))
+        && std::abs(aCurve2DParam1 - aCurve3DParam1) <= Precision::PConfusion()
+        && std::abs(aCurve2DParam2 - aCurve3DParam2) <= Precision::PConfusion())
     {
-      aSameRangeFlag     = BRep_Tool::SameRange(anEdgePr);
-      aSameParameterFlag = BRep_Tool::SameParameter(anEdgePr);
-      aTolerance         = aTolerancePr;
-      aTmpEdge           = anEdgePr;
+      const double anInputTolerance = BRep_Tool::Tolerance(theEdge);
+      const occ::handle<Adaptor3d_Curve> aCurve =
+        new GeomAdaptor_Curve(aCurve3D, aCurve3DParam1, aCurve3DParam2);
+      const occ::handle<Adaptor2d_Curve2d> aPCurve =
+        new Geom2dAdaptor_Curve(aCurve2D, aCurve2DParam1, aCurve2DParam2);
+      const occ::handle<Adaptor3d_Surface> aSurf = new GeomAdaptor_Surface(aSurface);
+      // Reserve the rest of the spatial error budget for the 3D curve.
+      Approx_SameParameter aSameParameter(aCurve, aPCurve, aSurf, 0.1 * anInputTolerance);
+      if (aSameParameter.IsDone() && !aSameParameter.IsSameParameter())
+      {
+        TopoDS_Edge aReparameterized = MakeEdgeOnCurve(theEdge);
+        aBuilder.UpdateEdge(aReparameterized, aSameParameter.Curve2d(), theFace, 0.);
+        aBuilder.Range(aReparameterized, theFace, aCurve3DParam1, aCurve3DParam2);
+        BRepLib_CheckCurveOnSurface aCheck(aReparameterized, theFace);
+        aCheck.Perform();
+        if (aCheck.IsDone() && aCheck.MaxDistance() <= anInputTolerance
+            && BRep_Tool::Tolerance(aReparameterized) <= anInputTolerance)
+        {
+          aTmpEdge           = aReparameterized;
+          aTolerance         = BRep_Tool::Tolerance(aTmpEdge);
+          aSameRangeFlag     = true;
+          aSameParameterFlag = true;
+        }
+      }
+    }
+
+    // pdn trying to recompute pcurve
+    if (aTolerance > std::min(1., 2. * thePrecision) || !aSameRangeFlag)
+    {
+      TopoDS_Edge anEdgePr = MakeEdgeOnCurve(theEdge);
+      anEdgeFixer->FixAddPCurve(anEdgePr, theFace, theIsSeam, thePrecision);
+      anEdgeFixer->FixSameParameter(anEdgePr);
+      const double aTolerancePr = BRep_Tool::Tolerance(anEdgePr);
+      // pdn choose the best pcurve
+      if (aTolerancePr < aTolerance || !aSameRangeFlag)
+      {
+        aSameRangeFlag     = BRep_Tool::SameRange(anEdgePr);
+        aSameParameterFlag = BRep_Tool::SameParameter(anEdgePr);
+        aTolerance         = aTolerancePr;
+        aTmpEdge           = anEdgePr;
+      }
     }
   }
 
