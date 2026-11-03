@@ -28,6 +28,7 @@
 #include <GeomAdaptor_Surface.hxx>
 #include <GeomInt_IntSS.hxx>
 #include <GeomInt_WLApprox.hxx>
+#include <GeomInt_ThePrmPrmSvSurfacesOfWLApprox.hxx>
 #include <GeomLib_Check2dBSplineCurve.hxx>
 #include <GeomLib_CheckBSplineCurve.hxx>
 #include <Geom_BSplineCurve.hxx>
@@ -54,6 +55,9 @@
 #include <TopoDS_Edge.hxx>
 #include <gp_Elips.hxx>
 #include <ApproxInt_KnotTools.hxx>
+#include <Standard_Failure.hxx>
+
+#include <cmath>
 
 static void Parameters(const occ::handle<GeomAdaptor_Surface>&,
                        const occ::handle<GeomAdaptor_Surface>&,
@@ -610,6 +614,142 @@ void IntTools_FaceFace::Perform(const TopoDS_Face& aF1,
 
 //=================================================================================================
 
+// Refine an over-tolerance coupled approximation. Keep the original curve unless
+// both surface residuals of a completed replacement satisfy the request.
+static bool RefineIntersection(const IntTools_Curve&                   theCurve,
+                               const occ::handle<GeomAdaptor_Surface>& theS1,
+                               const occ::handle<GeomAdaptor_Surface>& theS2,
+                               const double                            theTolerance,
+                               const bool                              theToRunParallel,
+                               IntTools_Curve&                         theResult)
+{
+  const auto aBS = occ::down_cast<Geom_BSplineCurve>(theCurve.Curve());
+  if (aBS.IsNull() || theCurve.FirstCurve2d().IsNull() || theCurve.SecondCurve2d().IsNull()
+      || theS1 == theS2 || theTolerance <= 0.)
+  {
+    return false;
+  }
+  const double aFirst = aBS->FirstParameter(), aLast = aBS->LastParameter();
+  if (Precision::IsInfinite(aFirst) || Precision::IsInfinite(aLast) || aLast <= aFirst)
+  {
+    return false;
+  }
+  // Each of the 3D and lifted 2D approximations uses part of the same spatial
+  // error budget. Surface resolutions convert that budget to parameter units.
+  const double aFitTolerance = 0.25 * theTolerance;
+  const double aTol2d = std::min(std::min(theS1->UResolution(aFitTolerance),
+                                       theS1->VResolution(aFitTolerance)),
+                                std::min(theS2->UResolution(aFitTolerance),
+                                         theS2->VResolution(aFitTolerance)));
+  // Fixed work limits: three progressively denser lines, at most 513 points.
+  for (int aLevel = 0, aNb = 32; aLevel < 3; ++aLevel, aNb *= 4)
+  {
+    occ::handle<IntSurf_LineOn2S> aPoints = new IntSurf_LineOn2S;
+    GeomInt_ThePrmPrmSvSurfacesOfWLApprox aSolver(theS1, theS2);
+    bool isComplete = true;
+    for (int aI = 0; aI <= aNb; ++aI)
+    {
+      const double   aT   = aI == aNb ? aLast : aFirst + (aLast - aFirst) * aI / aNb;
+      const gp_Pnt2d aUV1 = theCurve.FirstCurve2d()->Value(aT);
+      const gp_Pnt2d aUV2 = theCurve.SecondCurve2d()->Value(aT);
+      double aU1 = aUV1.X(), aV1 = aUV1.Y(), aU2 = aUV2.X(), aV2 = aUV2.Y();
+      gp_Pnt   aP;
+      gp_Vec   aTg;
+      gp_Vec2d aTg1, aTg2;
+      if (aI == 0 || aI == aNb)
+      {
+        aP = aBS->Value(aT);
+      }
+      else if (!aSolver.Compute(aU1, aV1, aU2, aV2, aP, aTg, aTg1, aTg2))
+      {
+        isComplete = false;
+        break;
+      }
+      // A local solve must stay near its seed, rather than select a remote
+      // branch. The neighbouring seed samples define the spatial scale.
+      const gp_Pnt aSeed = aBS->Value(aT);
+      const double aPrev = std::max(aFirst, aT - (aLast - aFirst) / aNb);
+      const double aNext = std::min(aLast, aT + (aLast - aFirst) / aNb);
+      const double aStep = aBS->Value(aPrev).Distance(aBS->Value(aNext));
+      const double aD1 = aP.Distance(theS1->Value(aU1, aV1));
+      const double aD2 = aP.Distance(theS2->Value(aU2, aV2));
+      if (!std::isfinite(aD1) || !std::isfinite(aD2) || aD1 > aFitTolerance
+          || aD2 > aFitTolerance
+          || aP.Distance(aSeed) > std::max(aStep, aFitTolerance))
+      {
+        isComplete = false;
+        break;
+      }
+      IntSurf_PntOn2S aPoint;
+      aPoint.SetValue(aP, aU1, aV1, aU2, aV2);
+      aPoints->Add(aPoint);
+    }
+    if (!isComplete)
+    {
+      break;
+    }
+    occ::handle<IntPatch_WLine> aLine = new IntPatch_WLine(aPoints, false);
+    GeomInt_WLApprox anApprox;
+    anApprox.SetParameters(aFitTolerance, aTol2d, 4, 8, 0, 30, true, Approx_ChordLength);
+    anApprox.Perform(theS1, theS2, aLine, true, true, true, 1, aLine->NbPnts());
+    if (!anApprox.IsDone() || anApprox.NbMultiCurves() != 1)
+    {
+      continue;
+    }
+    const AppParCurves_MultiBSpCurve& aMulti = anApprox.Value(1);
+    NCollection_Array1<gp_Pnt> aPoles(1, aMulti.NbPoles());
+    NCollection_Array1<gp_Pnt2d> aPoles1(1, aMulti.NbPoles()), aPoles2(1, aMulti.NbPoles());
+    aMulti.Curve(1, aPoles);
+    aMulti.Curve(2, aPoles1);
+    aMulti.Curve(3, aPoles2);
+    occ::handle<Geom_BSplineCurve> aC = new Geom_BSplineCurve(aPoles,
+                                                             aMulti.Knots(),
+                                                             aMulti.Multiplicities(),
+                                                             aMulti.Degree());
+    occ::handle<Geom2d_BSplineCurve> aC1 = new Geom2d_BSplineCurve(aPoles1,
+                                                                aMulti.Knots(),
+                                                                aMulti.Multiplicities(),
+                                                                aMulti.Degree());
+    occ::handle<Geom2d_BSplineCurve> aC2 = new Geom2d_BSplineCurve(aPoles2,
+                                                                aMulti.Knots(),
+                                                                aMulti.Multiplicities(),
+                                                                aMulti.Degree());
+    double aD1, aD2, aPar;
+    if (!IntTools_Tools::ComputeTolerance(aC,
+                                          aC1,
+                                          theS1->Surface(),
+                                          aC->FirstParameter(),
+                                          aC->LastParameter(),
+                                          aD1,
+                                          aPar,
+                                          Precision::PConfusion(),
+                                          theToRunParallel)
+        || !IntTools_Tools::ComputeTolerance(aC,
+                                             aC2,
+                                             theS2->Surface(),
+                                             aC->FirstParameter(),
+                                             aC->LastParameter(),
+                                             aD2,
+                                             aPar,
+                                             Precision::PConfusion(),
+                                             theToRunParallel))
+    {
+      continue;
+    }
+    const double aMeasured = std::max(aD1, aD2);
+    if (std::isfinite(aD1) && std::isfinite(aD2) && aMeasured <= theTolerance
+        && aC->Value(aC->FirstParameter()).Distance(aBS->Value(aFirst)) <= aFitTolerance
+        && aC->Value(aC->LastParameter()).Distance(aBS->Value(aLast)) <= aFitTolerance)
+    {
+      theResult = IntTools_Curve(aC, aC1, aC2, aMeasured, theCurve.TangentialTolerance());
+      return true;
+    }
+  }
+  return false;
+}
+
+//=================================================================================================
+
 void IntTools_FaceFace::ComputeTolReached3d(const bool theToRunParallel)
 {
   int i, j, aNbLin = mySeqOfCurve.Length();
@@ -678,6 +818,22 @@ void IntTools_FaceFace::ComputeTolReached3d(const bool theToRunParallel)
     }
     // Set the valid tolerance for the curve
     aIC.SetTolerance(aTolC);
+    if (myApprox && aTolC > myTolApprox)
+    {
+      // Refinement is optional: a singular solve must not replace the measured
+      // original approximation or suppress its actual tolerance.
+      try
+      {
+        IntTools_Curve aRefined;
+        if (RefineIntersection(aIC, myHS1, myHS2, myTolApprox, theToRunParallel, aRefined))
+        {
+          aIC = aRefined;
+        }
+      }
+      catch (const Standard_Failure&)
+      {
+      }
+    }
     //
     // Set the tangential tolerance for the curve.
     // Note, that, currently, computation of the tangential tolerance is
