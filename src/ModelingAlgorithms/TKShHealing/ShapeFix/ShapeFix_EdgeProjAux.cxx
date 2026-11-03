@@ -216,6 +216,8 @@ void ShapeFix_EdgeProjAux::Init2d(const double preci)
   {
     return; //: r5 abv 6 Apr 99:  ec_turbine-A.stp, #4313
   }
+  const double aPCFirst = cf;
+  const double aPCLast = cl;
   myFirstParam = 0.;
   myLastParam  = 0.;
   TopoDS_Vertex V1, V2;
@@ -414,6 +416,19 @@ void ShapeFix_EdgeProjAux::Init2d(const double preci)
   // ----------------------------------------------
   double Uinf = COnS.FirstParameter();
   double Usup = COnS.LastParameter();
+
+  // On a closed curve both geometric ends project to the same point. Prefer
+  // the existing edge interval when it already matches both 3D endpoints;
+  // an unconstrained projection can otherwise choose the opposite end.
+  if (aPCFirst < aPCLast && aPCFirst >= Uinf && aPCLast <= Usup
+      && COnS.Value(aPCFirst).Distance(Pt1) <= preci
+      && COnS.Value(aPCLast).Distance(Pt2) <= preci)
+  {
+    myFirstParam = aPCFirst;
+    myLastParam = aPCLast;
+    myFirstDone = myLastDone = true;
+    return;
+  }
 
   double              w1 = 0., w2 = 0.;
   ShapeAnalysis_Curve sac;
